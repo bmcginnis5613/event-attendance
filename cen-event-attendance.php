@@ -2,7 +2,9 @@
 /**
  * Plugin Name: CEN Event Attendance
  * Description: Adds a tab to the WordPress edit user page to display a list of events a user attended.
- * Version: 1.0.0
+ * Version: 1.0.2
+ * Author: FirstTracks Marketing
+ * Author URI: https://firsttracksmarketing.com
  */
 
 defined( 'ABSPATH' ) || exit;
@@ -161,26 +163,124 @@ function ceg_event_attendance_attendees_url( $event_id ) {
 
 
 /**
- * Render a concise attendance list from Event Tickets shortcode output.
+ * Get every event for which Event Tickets has an attendee record for a user.
  *
- * Event Tickets includes the event post ID in each list item's `event-{ID}`
- * class. Using those IDs lets this screen control the displayed fields while
- * leaving attendance lookup and ticket-provider compatibility to the plugin.
+ * The Event Tickets confirmation shortcode only queries upcoming events. This
+ * uses the same attendee/event relationships without its end-date restriction
+ * so previous events are included too. It matches both the WordPress user ID
+ * and attendee email because guest and admin-created RSVPs are not necessarily
+ * connected to a WordPress account.
  *
- * @param string $shortcode_output Event Tickets attendance-list markup.
+ * @param int $user_id WordPress user ID.
+ *
+ * @return int[] Event post IDs, newest first.
  */
-function ceg_event_attendance_render_list( $shortcode_output ) {
+function ceg_event_attendance_get_event_ids( $user_id ) {
+	global $wpdb;
 
-	$matches = array();
-	preg_match_all( '/\bevent-(\d+)\b/', $shortcode_output, $matches );
+	if ( ! class_exists( 'Tribe__Tickets__Tickets' ) ) {
+		return array();
+	}
 
-	$event_ids = isset( $matches[1] )
-		? array_values( array_unique( array_map( 'absint', $matches[1] ) ) )
-		: array();
+	$event_keys = array();
+	$email_keys = array(
+		'_tribe_rsvp_email',
+		'_tribe_tickets_email',
+		'_tribe_tpp_email',
+	);
+	$user       = get_userdata( $user_id );
+
+	if ( ! $user ) {
+		return array();
+	}
+
+	foreach ( Tribe__Tickets__Tickets::modules() as $module_class => $module_instance ) {
+		$constant_name = "$module_class::ATTENDEE_EVENT_KEY";
+
+		if ( defined( $constant_name ) ) {
+			$event_keys[] = constant( $constant_name );
+		} elseif ( is_callable( array( $module_class, 'get_key' ) ) ) {
+			$event_keys[] = call_user_func( array( $module_class, 'get_key' ), 'ATTENDEE_EVENT_KEY' );
+		}
+
+		if ( is_object( $module_instance ) && ! empty( $module_instance->email ) ) {
+			$email_keys[] = $module_instance->email;
+		}
+	}
+
+	$event_keys = array_values( array_unique( array_filter( $event_keys ) ) );
+	$email_keys = array_values( array_unique( array_filter( $email_keys ) ) );
+
+	if ( empty( $event_keys ) ) {
+		return array();
+	}
+
+	$key_placeholders = implode( ', ', array_fill( 0, count( $event_keys ), '%s' ) );
+	$email_placeholders = implode( ', ', array_fill( 0, count( $email_keys ), '%s' ) );
+	$query_args         = array_merge(
+		array( absint( $user_id ) ),
+		$email_keys,
+		array( $user->user_email ),
+		$event_keys
+	);
+
+	$query = "
+		SELECT event_list.ID
+		FROM {$wpdb->postmeta} AS match_identity
+		INNER JOIN {$wpdb->postmeta} AS match_events
+			ON match_events.post_id = match_identity.post_id
+		INNER JOIN {$wpdb->posts} AS event_list
+			ON event_list.ID = match_events.meta_value
+		LEFT JOIN {$wpdb->postmeta} AS event_start_dates
+			ON event_start_dates.post_id = event_list.ID
+			AND event_start_dates.meta_key = '_EventStartDateUTC'
+		WHERE (
+				(
+					match_identity.meta_key = '_tribe_tickets_attendee_user_id'
+					AND match_identity.meta_value = %d
+				)
+				OR (
+					match_identity.meta_key IN ( $email_placeholders )
+					AND LOWER( match_identity.meta_value ) = LOWER( %s )
+				)
+			)
+			AND match_events.meta_key IN ( $key_placeholders )
+			AND event_list.post_status NOT IN ( 'trash', 'auto-draft' )
+			AND NOT EXISTS (
+				SELECT 1
+				FROM {$wpdb->postmeta} AS ticket_status
+				WHERE ticket_status.meta_key = '_wp_trash_meta_status'
+					AND ticket_status.post_id = match_events.post_id
+			)
+			AND NOT EXISTS (
+				SELECT 1
+				FROM {$wpdb->postmeta} AS rsvp_status
+				WHERE rsvp_status.meta_key = '_tribe_rsvp_status'
+					AND rsvp_status.meta_value = 'no'
+					AND rsvp_status.post_id = match_events.post_id
+			)
+		GROUP BY event_list.ID
+		ORDER BY COALESCE( MAX( event_start_dates.meta_value ), MAX( event_list.post_date ) ) DESC
+	";
+
+	// The placeholders are constructed above from Event Tickets provider keys.
+	$prepared_query = $wpdb->prepare( $query, $query_args ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+
+	return array_map( 'absint', (array) $wpdb->get_col( $prepared_query ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+}
+
+
+/**
+ * Render a concise attendance list.
+ *
+ * @param int[] $event_ids Event post IDs.
+ */
+function ceg_event_attendance_render_list( $event_ids ) {
+
+	$event_ids = array_values( array_unique( array_map( 'absint', $event_ids ) ) );
 
 	if ( empty( $event_ids ) ) {
-		// Preserve Event Tickets' own empty-state or error message.
-		echo wp_kses_post( $shortcode_output );
+		echo '<p>This user has not RSVP\'d to any events.</p>';
 		return;
 	}
 
@@ -316,16 +416,10 @@ function ceg_event_attendance_page() {
 
 			<?php
 
-			if ( shortcode_exists( 'tribe-user-event-confirmations' ) ) {
+			if ( class_exists( 'Tribe__Tickets__Tickets' ) ) {
 
-				$attendance_output = do_shortcode(
-					sprintf(
-						'[tribe-user-event-confirmations user="%d"]',
-						$user_id
-					)
-				);
-
-				ceg_event_attendance_render_list( $attendance_output );
+				$event_ids = ceg_event_attendance_get_event_ids( $user_id );
+				ceg_event_attendance_render_list( $event_ids );
 
 			} else {
 
