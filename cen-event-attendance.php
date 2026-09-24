@@ -1,6 +1,6 @@
 <?php
 /**
- * Plugin Name: CEN Event Attendance
+ * Plugin Name: Event Attendance
  * Description: Adds a tab to the WordPress edit user page to display a list of events a user attended.
  * Version: 1.0.2
  * Author: FirstTracks Marketing
